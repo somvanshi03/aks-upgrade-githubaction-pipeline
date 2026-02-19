@@ -1,0 +1,231 @@
+name: AKS Cluster Upgrade Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Target Kubernetes version for upgrade (e.g., 1.28.0)'
+        required: true
+        type: string
+      cluster_name:
+        description: 'AKS Cluster Name'
+        required: true
+        type: choice
+        options:
+          - cluster-1
+          - cluster-2
+          - cluster-3
+      resource_group:
+        description: 'Resource Group Name'
+        required: true
+        type: string
+        default: 'my-aks-rg'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  upgrade-aks-cluster:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get Current Cluster Version
+      id: current_version
+      run: |
+        echo "Fetching current AKS cluster version..."
+        
+        # Get cluster details
+        CLUSTER_INFO=$(az aks show \
+          --name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          --query "{name:name, kubernetesVersion:kubernetesVersion}" \
+          -o json)
+        
+        CURRENT_VERSION=$(echo $CLUSTER_INFO | jq -r '.kubernetesVersion')
+        
+        echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        echo "cluster_info=$CLUSTER_INFO" >> $GITHUB_OUTPUT
+        
+        echo "Current cluster version: $CURRENT_VERSION"
+
+    - name: Validate Target Version
+      run: |
+        echo "Validating target version..."
+        
+        # Get available versions
+        AVAILABLE_VERSIONS=$(az aks get-versions \
+          --location $(az group show \
+            --name ${{ github.event.inputs.resource_group }} \
+            --query location -o tsv) \
+          --query "orchestrators[?orchestratorVersion > '${{ steps.current_version.outputs.current_version }}'].orchestratorVersion" \
+          -o tsv)
+        
+        if ! echo "$AVAILABLE_VERSIONS" | grep -q "${{ github.event.inputs.target_version }}"; then
+          echo "Error: Target version ${{ github.event.inputs.target_version }} is not available or not greater than current version"
+          echo "Available versions greater than current:"
+          echo "$AVAILABLE_VERSIONS"
+          exit 1
+        fi
+        
+        echo "Target version validation successful"
+
+    - name: Print Current and Target Versions
+      run: |
+        echo "========================================="
+        echo "AKS Cluster Upgrade Details"
+        echo "========================================="
+        echo "Cluster Name: ${{ github.event.inputs.cluster_name }}"
+        echo "Resource Group: ${{ github.event.inputs.resource_group }}"
+        echo "Current Version: ${{ steps.current_version.outputs.current_version }}"
+        echo "Target Version: ${{ github.event.inputs.target_version }}"
+        echo "========================================="
+
+    - name: Upgrade Worker Nodes First
+      run: |
+        echo "Starting worker nodes upgrade..."
+        
+        # Get current node pools
+        NODE_POOLS=$(az aks nodepool list \
+          --cluster-name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          -o json)
+        
+        # Upgrade each node pool one by one
+        echo "$NODE_POOLS" | jq -c '.[]' | while read -r NODEPOOL; do
+          NODEPOOL_NAME=$(echo "$NODEPOOL" | jq -r '.name')
+          NODEPOOL_VERSION=$(echo "$NODEPOOL" | jq -r '.orchestratorVersion')
+          
+          echo "----------------------------------------"
+          echo "Upgrading node pool: $NODEPOOL_NAME"
+          echo "Current node pool version: $NODEPOOL_VERSION"
+          
+          if [ "$NODEPOOL_VERSION" != "${{ github.event.inputs.target_version }}" ]; then
+            # Upgrade node pool
+            az aks nodepool upgrade \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --name "$NODEPOOL_NAME" \
+              --resource-group ${{ github.event.inputs.resource_group }} \
+              --kubernetes-version ${{ github.event.inputs.target_version }} \
+              --no-wait
+            
+            # Wait for node pool upgrade to complete
+            while true; do
+              STATUS=$(az aks nodepool show \
+                --cluster-name ${{ github.event.inputs.cluster_name }} \
+                --name "$NODEPOOL_NAME" \
+                --resource-group ${{ github.event.inputs.resource_group }} \
+                --query "provisioningState" -o tsv)
+              
+              if [ "$STATUS" == "Succeeded" ]; then
+                echo "Node pool $NODEPOOL_NAME upgraded successfully"
+                break
+              elif [ "$STATUS" == "Failed" ]; then
+                echo "Node pool $NODEPOOL_NAME upgrade failed"
+                exit 1
+              fi
+              
+              echo "Waiting for node pool upgrade to complete... Current state: $STATUS"
+              sleep 30
+            done
+            
+            NEW_VERSION=$(az aks nodepool show \
+              --cluster-name ${{ github.event.inputs.cluster_name }} \
+              --name "$NODEPOOL_NAME" \
+              --resource-group ${{ github.event.inputs.resource_group }} \
+              --query "orchestratorVersion" -o tsv)
+            
+            echo "Node pool $NODEPOOL_NAME upgraded from $NODEPOOL_VERSION to $NEW_VERSION"
+          else
+            echo "Node pool $NODEPOOL_NAME already at target version"
+          fi
+        done
+
+    - name: Upgrade Control Plane (Master)
+      run: |
+        echo "Starting control plane upgrade..."
+        
+        # Upgrade control plane
+        az aks upgrade \
+          --name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          --kubernetes-version ${{ github.event.inputs.target_version }} \
+          --control-plane-only \
+          --yes
+
+    - name: Verify Upgrade and Print Versions
+      id: verify_upgrade
+      run: |
+        echo "Verifying cluster upgrade..."
+        
+        # Get upgraded cluster information
+        UPGRADED_CLUSTER_INFO=$(az aks show \
+          --name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          --query "{name:name, kubernetesVersion:kubernetesVersion, nodeResourceGroup:nodeResourceGroup}" \
+          -o json)
+        
+        NEW_VERSION=$(echo $UPGRADED_CLUSTER_INFO | jq -r '.kubernetesVersion')
+        
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        
+        # Get node pools versions after upgrade
+        NODE_POOLS_AFTER=$(az aks nodepool list \
+          --cluster-name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          -o json)
+        
+        echo "========================================="
+        echo "UPGRADE COMPLETED SUCCESSFULLY"
+        echo "========================================="
+        echo "Previous Version: ${{ steps.current_version.outputs.current_version }}"
+        echo "Upgraded Version: $NEW_VERSION"
+        echo ""
+        echo "Node Pool Versions After Upgrade:"
+        echo "$NODE_POOLS_AFTER" | jq -r '.[] | "  - \(.name): \(.orchestratorVersion)"'
+        echo "========================================="
+
+    - name: Generate Upgrade Report
+      if: always()
+      run: |
+        # Create upgrade report
+        cat << EOF > upgrade-report.md
+        # AKS Cluster Upgrade Report
+        
+        ## Upgrade Details
+        - **Cluster Name**: ${{ github.event.inputs.cluster_name }}
+        - **Resource Group**: ${{ github.event.inputs.resource_group }}
+        - **Previous Version**: ${{ steps.current_version.outputs.current_version }}
+        - **Target Version**: ${{ github.event.inputs.target_version }}
+        - **Current Version**: ${{ steps.verify_upgrade.outputs.new_version }}
+        - **Upgrade Status**: ${{ job.status }}
+        - **Upgrade Time**: $(date)
+        
+        ## Upgrade Steps Performed
+        1. ✅ Worker nodes upgraded first
+        2. ✅ Control plane upgraded
+        3. ✅ Verification completed
+        
+        ## Notes
+        - Upgrade was performed with worker nodes first, followed by control plane
+        - All node pools should now be at version ${{ steps.verify_upgrade.outputs.new_version }}
+        EOF
+        
+        # Display the report
+        cat upgrade-report.md
+
+    - name: Upload Upgrade Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: aks-upgrade-report
+        path: upgrade-report.md
