@@ -1,0 +1,67 @@
+name: AKS Cluster Info
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Select Resource Group"
+        required: true
+        type: choice
+        options:
+          - rg-dev-eastus
+          - rg-prod-eastus
+          - rg-test-centralus
+
+      aks_cluster:
+        description: "Select AKS Cluster Name"
+        required: true
+        type: choice
+        options:
+          - aks-dev-cluster
+          - aks-prod-cluster
+          - aks-test-cluster
+
+jobs:
+  aks-info:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ github.event.inputs.resource_group }} \
+            --name ${{ github.event.inputs.aks_cluster }} \
+            --overwrite-existing
+
+      - name: Fetch Cluster Information
+        run: |
+          echo "========== AKS CLUSTER INFO =========="
+          az aks show \
+            --resource-group ${{ github.event.inputs.resource_group }} \
+            --name ${{ github.event.inputs.aks_cluster }} \
+            --query "{ClusterName:name, Location:location, KubernetesVersion:kubernetesVersion, NodeResourceGroup:nodeResourceGroup}" \
+            -o table
+
+      - name: Fetch Node Details
+        run: |
+          echo "========== WORKER NODE DETAILS =========="
+          kubectl get nodes -o wide
+
+      - name: Detailed Node Info
+        run: |
+          echo "========== NODE VERSION DETAILS =========="
+          kubectl get nodes -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,K8S_VERSION:.status.nodeInfo.kubeletVersion,OS_IMAGE:.status.nodeInfo.osImage,CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion
