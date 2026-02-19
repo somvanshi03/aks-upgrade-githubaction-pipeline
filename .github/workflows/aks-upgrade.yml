@@ -1,4 +1,4 @@
-name: Safe AKS Cluster Upgrade Pipeline
+name: Safe AKS Cluster Upgrade
 
 on:
   workflow_dispatch:
