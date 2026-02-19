@@ -8,8 +8,8 @@ on:
         required: true
         type: choice
         options:
-          - agicdemo
-          - prod-rg
+          - agicdemo-1
+          - agicdemo-2
           - dev-rg
           - staging-rg
       cluster_name:
@@ -17,8 +17,8 @@ on:
         required: true
         type: choice
         options:
-          - agic-cluster
-          - prod-cluster
+          - agic-cluster-1
+          - agic-cluster-2
           - dev-cluster
           - staging-cluster
       target_version:
