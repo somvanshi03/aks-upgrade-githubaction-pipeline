@@ -8,8 +8,8 @@ on:
         required: true
         type: choice
         options:
-          - rg-dev-eastus
-          - rg-prod-eastus
+          - agicdemo-1
+          - agicdemo-2
           - rg-test-centralus
 
       aks_cluster:
@@ -17,8 +17,8 @@ on:
         required: true
         type: choice
         options:
-          - aks-dev-cluster
-          - aks-prod-cluster
+          - agic-cluster-1
+          - agic-cluster-1
           - aks-test-cluster
 
 jobs:
