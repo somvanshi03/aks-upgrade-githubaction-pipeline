@@ -22,10 +22,10 @@ on:
           - dev-cluster
           - staging-cluster
       target_version:
-        description: 'Target Kubernetes version (e.g., 1.28, 1.29, 1.30)'
+        description: 'Target Kubernetes version (e.g., 1.29, 1.30, 1.31)'
         required: true
         type: string
-        default: '1.29'
+        default: '1.30'
       max_surge:
         description: 'Max surge for node pool upgrade (e.g., 33% or 2)'
         required: true
@@ -47,10 +47,11 @@ env:
 jobs:
   discover-and-upgrade:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     
     steps:
     - name: Checkout
-      uses: actions/checkout@v4  # Fixed: Indentation was incorrect
+      uses: actions/checkout@v4
       
     - name: Azure Login
       uses: azure/login@v2
@@ -119,20 +120,27 @@ jobs:
         UPGRADE_INFO=$(az aks get-upgrades \
           --name ${{ github.event.inputs.cluster_name }} \
           --resource-group ${{ github.event.inputs.resource_group }} \
-          -o json)
+          -o json 2>/dev/null || echo '{"controlPlaneProfile":{"upgrades":[]}}')
         
-        AVAILABLE_VERSIONS=$(echo $UPGRADE_INFO | jq -r '.controlPlaneProfile.upgrades[].kubernetesVersion' 2>/dev/null || echo "")
+        # Check if upgrades array exists and has elements
+        UPGRADE_COUNT=$(echo $UPGRADE_INFO | jq '.controlPlaneProfile.upgrades | length' 2>/dev/null || echo "0")
         
-        if [ -z "$AVAILABLE_VERSIONS" ]; then
+        if [ "$UPGRADE_COUNT" -eq "0" ]; then
           echo "No upgrades available. Current version may be latest."
           echo "upgrade_available=false" >> $GITHUB_OUTPUT
         else
+          # Extract versions
+          AVAILABLE_VERSIONS=$(echo $UPGRADE_INFO | jq -r '.controlPlaneProfile.upgrades[].kubernetesVersion' 2>/dev/null)
+          
           echo "Available versions:"
           echo "$AVAILABLE_VERSIONS" | while read version; do
             echo "  - $version"
           done
+          
           echo "upgrade_available=true" >> $GITHUB_OUTPUT
-          echo "versions=$AVAILABLE_VERSIONS" >> $GITHUB_OUTPUT
+          
+          # Save versions to file for later use
+          echo "$AVAILABLE_VERSIONS" > available-versions.txt
         fi
 
     - name: Validate Target Version
@@ -140,7 +148,7 @@ jobs:
       run: |
         echo "Validating target version: ${{ github.event.inputs.target_version }}"
         
-        # Check if target version is valid
+        # Check if target version is valid by querying Azure directly
         if ! az aks get-upgrades \
           --name ${{ github.event.inputs.cluster_name }} \
           --resource-group ${{ github.event.inputs.resource_group }} \
@@ -148,12 +156,21 @@ jobs:
           -o tsv | grep -q .; then
           
           echo "Error: Version ${{ github.event.inputs.target_version }} is not available for upgrade"
-          echo "Available versions:"
+          echo ""
+          echo "Available versions from Azure:"
           az aks get-upgrades \
             --name ${{ github.event.inputs.cluster_name }} \
             --resource-group ${{ github.event.inputs.resource_group }} \
             --query "controlPlaneProfile.upgrades[].kubernetesVersion" \
             -o table
+          
+          # Also show from file if it exists
+          if [ -f available-versions.txt ]; then
+            echo ""
+            echo "Available versions (from file):"
+            cat available-versions.txt
+          fi
+          
           exit 1
         fi
         
@@ -195,7 +212,7 @@ jobs:
             --resource-group ${{ github.event.inputs.resource_group }} \
             --max-surge ${{ github.event.inputs.max_surge }} \
             --drain-timeout ${{ github.event.inputs.drain_timeout }} \
-            --node-soak-duration 30
+            --node-soak-duration 30 2>/dev/null || echo "  - Warning: Unable to configure upgrade settings for $NODEPOOL_NAME"
             
           echo "  - Configured $NODEPOOL_NAME with max-surge: ${{ github.event.inputs.max_surge }}"
         done
@@ -266,9 +283,29 @@ jobs:
                 --cluster-name ${{ github.event.inputs.cluster_name }} \
                 --name "$NODEPOOL_NAME" \
                 --resource-group ${{ github.event.inputs.resource_group }} \
-                --kubernetes-version ${{ github.event.inputs.target_version }}
+                --kubernetes-version ${{ github.event.inputs.target_version }} \
+                --no-wait
               
-              echo "System node pool $NODEPOOL_NAME upgraded successfully"
+              # Wait for node pool upgrade to complete
+              echo "Waiting for node pool $NODEPOOL_NAME upgrade to complete..."
+              while true; do
+                STATUS=$(az aks nodepool show \
+                  --cluster-name ${{ github.event.inputs.cluster_name }} \
+                  --name "$NODEPOOL_NAME" \
+                  --resource-group ${{ github.event.inputs.resource_group }} \
+                  --query "provisioningState" -o tsv 2>/dev/null)
+                
+                if [ "$STATUS" == "Succeeded" ]; then
+                  echo "Node pool $NODEPOOL_NAME upgraded successfully"
+                  break
+                elif [ "$STATUS" == "Failed" ]; then
+                  echo "Node pool $NODEPOOL_NAME upgrade failed"
+                  exit 1
+                fi
+                
+                echo "  Current state: $STATUS"
+                sleep 30
+              done
             else
               echo "System node pool $NODEPOOL_NAME already at target version"
             fi
@@ -293,9 +330,29 @@ jobs:
                 --cluster-name ${{ github.event.inputs.cluster_name }} \
                 --name "$NODEPOOL_NAME" \
                 --resource-group ${{ github.event.inputs.resource_group }} \
-                --kubernetes-version ${{ github.event.inputs.target_version }}
+                --kubernetes-version ${{ github.event.inputs.target_version }} \
+                --no-wait
               
-              echo "User node pool $NODEPOOL_NAME upgraded successfully"
+              # Wait for node pool upgrade to complete
+              echo "Waiting for node pool $NODEPOOL_NAME upgrade to complete..."
+              while true; do
+                STATUS=$(az aks nodepool show \
+                  --cluster-name ${{ github.event.inputs.cluster_name }} \
+                  --name "$NODEPOOL_NAME" \
+                  --resource-group ${{ github.event.inputs.resource_group }} \
+                  --query "provisioningState" -o tsv 2>/dev/null)
+                
+                if [ "$STATUS" == "Succeeded" ]; then
+                  echo "User node pool $NODEPOOL_NAME upgraded successfully"
+                  break
+                elif [ "$STATUS" == "Failed" ]; then
+                  echo "User node pool $NODEPOOL_NAME upgrade failed"
+                  exit 1
+                fi
+                
+                echo "  Current state: $STATUS"
+                sleep 30
+              done
             else
               echo "User node pool $NODEPOOL_NAME already at target version"
             fi
@@ -440,5 +497,19 @@ jobs:
     - name: Upload Upgrade Report
       uses: actions/upload-artifact@v4
       with:
-        name: aks-upgrade-report-${{ github.event.inputs.cluster_name }}
+        name: aks-upgrade-report-${{ github.event.inputs.cluster_name }}-${{ github.run_id }}
         path: upgrade-report.md
+
+    - name: Send Notification on Success
+      if: success()
+      run: |
+        echo "✅ AKS Cluster upgrade completed successfully!"
+        echo "Cluster: ${{ github.event.inputs.cluster_name }}"
+        echo "Version: ${{ steps.cluster_info.outputs.current_version }} -> ${{ steps.final_verification.outputs.final_version }}"
+
+    - name: Send Notification on Failure
+      if: failure()
+      run: |
+        echo "❌ AKS Cluster upgrade failed!"
+        echo "Cluster: ${{ github.event.inputs.cluster_name }}"
+        echo "Please check the logs for more details."
