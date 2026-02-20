@@ -36,6 +36,15 @@ on:
         required: true
         type: string
         default: '30'
+      upgrade_strategy:
+        description: 'Upgrade Strategy'
+        required: true
+        type: choice
+        options:
+          - 'Automatic (Control plane first, then node pools)'
+          - 'Control Plane Only'
+          - 'Node Pools Only'
+        default: 'Automatic (Control plane first, then node pools)'
 
 permissions:
   id-token: write
@@ -198,6 +207,7 @@ jobs:
         echo "node_pool_count=$NODE_POOL_COUNT" >> $GITHUB_OUTPUT
 
     - name: Enable Upgrade Settings for Zero Downtime
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
         echo "Configuring node pools for zero-downtime upgrade..."
         
@@ -249,7 +259,51 @@ jobs:
         
         echo "Pre-upgrade health check completed"
 
+    - name: Get Control Plane Version
+      id: control_plane
+      run: |
+        CONTROL_PLANE_VERSION=$(az aks show \
+          --name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          --query "kubernetesVersion" -o tsv)
+        
+        echo "control_plane_version=$CONTROL_PLANE_VERSION" >> $GITHUB_OUTPUT
+        echo "Control plane version: $CONTROL_PLANE_VERSION"
+
+    - name: Upgrade Control Plane
+      if: github.event.inputs.upgrade_strategy != 'Node Pools Only'
+      run: |
+        echo "========================================="
+        echo "Starting control plane upgrade"
+        echo "========================================="
+        
+        CURRENT_CP_VERSION="${{ steps.control_plane.outputs.control_plane_version }}"
+        TARGET_VERSION="${{ github.event.inputs.target_version }}"
+        
+        # Extract minor versions for comparison
+        CURRENT_MINOR=$(echo $CURRENT_CP_VERSION | cut -d. -f2)
+        TARGET_MINOR=$(echo $TARGET_VERSION | cut -d. -f2)
+        
+        if [ "$CURRENT_MINOR" == "$TARGET_MINOR" ]; then
+          echo "Control plane already at target minor version. Skipping control plane upgrade."
+        elif [ "$TARGET_MINOR" -gt "$CURRENT_MINOR" ]; then
+          echo "Upgrading control plane from $CURRENT_CP_VERSION to $TARGET_VERSION..."
+          
+          # Upgrade control plane
+          az aks upgrade \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --resource-group ${{ github.event.inputs.resource_group }} \
+            --kubernetes-version $TARGET_VERSION \
+            --control-plane-only \
+            --yes
+          
+          echo "Control plane upgrade completed"
+        else
+          echo "Target version ($TARGET_VERSION) is older than current control plane ($CURRENT_CP_VERSION). Skipping control plane upgrade."
+        fi
+
     - name: Upgrade Worker Nodes (Zero Downtime)
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
         echo "========================================="
         echo "Starting worker nodes upgrade (zero downtime)"
@@ -258,6 +312,26 @@ jobs:
         # Check if node-pools.json exists
         if [ ! -f node-pools.json ]; then
           echo "Error: node-pools.json not found"
+          exit 1
+        fi
+        
+        # Get updated control plane version
+        CONTROL_PLANE_VERSION=$(az aks show \
+          --name ${{ github.event.inputs.cluster_name }} \
+          --resource-group ${{ github.event.inputs.resource_group }} \
+          --query "kubernetesVersion" -o tsv)
+        
+        echo "Current control plane version: $CONTROL_PLANE_VERSION"
+        echo "Target version for node pools: ${{ github.event.inputs.target_version }}"
+        
+        # Validate node pool version compatibility
+        CP_MINOR=$(echo $CONTROL_PLANE_VERSION | cut -d. -f2)
+        TARGET_MINOR=$(echo ${{ github.event.inputs.target_version }} | cut -d. -f2)
+        
+        if [ "$TARGET_MINOR" -gt "$CP_MINOR" ]; then
+          echo "⚠️ Cannot upgrade node pools to ${{ github.event.inputs.target_version }} because control plane is at $CONTROL_PLANE_VERSION"
+          echo "Node pools cannot have a higher minor version than control plane"
+          echo "Please run control plane upgrade first or use Automatic strategy"
           exit 1
         fi
         
@@ -278,6 +352,12 @@ jobs:
             echo "Current version: $CURRENT_VERSION"
             
             if [ "$CURRENT_VERSION" != "${{ github.event.inputs.target_version }}" ]; then
+              # Check compatibility
+              NODE_MINOR=$(echo $CURRENT_VERSION | cut -d. -f2)
+              if [ "$TARGET_MINOR" -gt "$NODE_MINOR" ] && [ "$TARGET_MINOR" -lt "$((CP_MINOR-1))" ]; then
+                echo "Warning: Upgrading from $CURRENT_VERSION to ${{ github.event.inputs.target_version }} (skipping intermediate versions)"
+              fi
+              
               # Upgrade node pool with zero-downtime settings
               az aks nodepool upgrade \
                 --cluster-name ${{ github.event.inputs.cluster_name }} \
@@ -325,6 +405,12 @@ jobs:
             echo "Current version: $CURRENT_VERSION"
             
             if [ "$CURRENT_VERSION" != "${{ github.event.inputs.target_version }}" ]; then
+              # Check compatibility
+              NODE_MINOR=$(echo $CURRENT_VERSION | cut -d. -f2)
+              if [ "$TARGET_MINOR" -gt "$NODE_MINOR" ] && [ "$TARGET_MINOR" -lt "$((CP_MINOR-1))" ]; then
+                echo "Warning: Upgrading from $CURRENT_VERSION to ${{ github.event.inputs.target_version }} (skipping intermediate versions)"
+              fi
+              
               # Upgrade node pool with zero-downtime settings
               az aks nodepool upgrade \
                 --cluster-name ${{ github.event.inputs.cluster_name }} \
@@ -360,6 +446,7 @@ jobs:
         fi
 
     - name: Post-Worker-Upgrade Health Check
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
         echo "========================================="
         echo "Performing post-worker-upgrade health check"
@@ -376,22 +463,6 @@ jobs:
         # Check all pods are running
         echo "Checking pod status..."
         kubectl get pods --all-namespaces 2>/dev/null | grep -v Running | grep -v Completed || echo "All pods are running normally"
-
-    - name: Upgrade Control Plane
-      run: |
-        echo "========================================="
-        echo "Starting control plane upgrade"
-        echo "========================================="
-        
-        # Upgrade control plane only
-        az aks upgrade \
-          --name ${{ github.event.inputs.cluster_name }} \
-          --resource-group ${{ github.event.inputs.resource_group }} \
-          --kubernetes-version ${{ github.event.inputs.target_version }} \
-          --control-plane-only \
-          --yes
-        
-        echo "Control plane upgrade completed"
 
     - name: Final Verification
       id: final_verification
@@ -420,6 +491,7 @@ jobs:
         echo "Previous Version: ${{ steps.cluster_info.outputs.current_version }}"
         echo "Upgraded Version: $FINAL_VERSION"
         echo "Cluster State: $CLUSTER_STATE"
+        echo "Upgrade Strategy: ${{ github.event.inputs.upgrade_strategy }}"
         
         # Get final node pool versions
         echo ""
@@ -463,6 +535,7 @@ jobs:
         - **Current Version**: ${{ steps.final_verification.outputs.final_version }}
         - **Upgrade Status**: ${{ job.status }}
         - **Upgrade Time**: $(date)
+        - **Upgrade Strategy**: ${{ github.event.inputs.upgrade_strategy }}
         
         ## Upgrade Configuration
         - **Max Surge**: ${{ github.event.inputs.max_surge }}
@@ -471,9 +544,9 @@ jobs:
         
         ## Upgrade Process
         1. ✅ Pre-upgrade health check completed
-        2. ✅ Worker nodes upgraded (zero downtime)
-        3. ✅ Post-worker health check passed
-        4. ✅ Control plane upgraded
+        ${{ github.event.inputs.upgrade_strategy != 'Node Pools Only' && '2. ✅ Control plane upgraded' || '2. ⏭️ Control plane upgrade skipped' }}
+        ${{ github.event.inputs.upgrade_strategy != 'Control Plane Only' && '3. ✅ Worker nodes upgraded (zero downtime)' || '3. ⏭️ Worker nodes upgrade skipped' }}
+        4. ✅ Post-worker health check passed
         5. ✅ Final verification completed
         6. ✅ Application verification completed
         
@@ -503,13 +576,22 @@ jobs:
     - name: Send Notification on Success
       if: success()
       run: |
-        echo "✅ AKS Cluster upgrade completed successfully!"
+        echo "========================================="
+        echo "✅ UPGRADE COMPLETED SUCCESSFULLY"
+        echo "========================================="
         echo "Cluster: ${{ github.event.inputs.cluster_name }}"
         echo "Version: ${{ steps.cluster_info.outputs.current_version }} -> ${{ steps.final_verification.outputs.final_version }}"
+        echo "Strategy: ${{ github.event.inputs.upgrade_strategy }}"
+        echo "========================================="
 
     - name: Send Notification on Failure
       if: failure()
       run: |
-        echo "❌ AKS Cluster upgrade failed!"
+        echo "========================================="
+        echo "❌ UPGRADE FAILED"
+        echo "========================================="
         echo "Cluster: ${{ github.event.inputs.cluster_name }}"
+        echo "Resource Group: ${{ github.event.inputs.resource_group }}"
+        echo "Target Version: ${{ github.event.inputs.target_version }}"
         echo "Please check the logs for more details."
+        echo "========================================="
