@@ -4,23 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       resource_group:
-        description: 'Select Resource Group'
+        description: 'Resource Group name (e.g., my-prod-rg)'
         required: true
-        type: choice
-        options:
-          - agicdemo-1
-          - agicdemo-2
-          - dev-rg
-          - staging-rg
+        type: string
       cluster_name:
-        description: 'Select AKS Cluster'
+        description: 'AKS Cluster name (e.g., my-aks-cluster)'
         required: true
-        type: choice
-        options:
-          - agic-cluster-1
-          - agic-cluster-2
-          - dev-cluster
-          - staging-cluster
+        type: string
       target_version:
         description: 'Target Kubernetes version (e.g., 1.29, 1.30, 1.31)'
         required: true
@@ -46,7 +36,7 @@ on:
           - 'Node Pools Only'
         default: 'Automatic (Control plane first, then node pools)'
 
-# ─── FIX: Concurrency lock prevents parallel upgrades on the same cluster ───
+# Concurrency lock — prevents two runs targeting the same cluster simultaneously
 concurrency:
   group: aks-upgrade-${{ github.event.inputs.cluster_name }}
   cancel-in-progress: false
@@ -57,26 +47,26 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # STAGE 1 — Manual approval gate before anything touches the cluster
-  # Requires a GitHub Environment named "aks-production" with required reviewers
+  # STAGE 1 — Manual approval gate
+  # Configure required reviewers in GitHub → Settings → Environments → aks-production
   # ─────────────────────────────────────────────────────────────────────────
   request-approval:
     runs-on: ubuntu-latest
-    environment: aks-production          # <── configure required reviewers here
+    environment: aks-production
     steps:
       - name: Approval gate
         run: |
           echo "========================================="
           echo "UPGRADE APPROVED"
-          echo "Cluster  : ${{ github.event.inputs.cluster_name }}"
-          echo "RG       : ${{ github.event.inputs.resource_group }}"
-          echo "Target   : ${{ github.event.inputs.target_version }}"
-          echo "Strategy : ${{ github.event.inputs.upgrade_strategy }}"
-          echo "Triggered by: ${{ github.actor }}"
+          echo "  Cluster  : ${{ github.event.inputs.cluster_name }}"
+          echo "  RG       : ${{ github.event.inputs.resource_group }}"
+          echo "  Target   : ${{ github.event.inputs.target_version }}"
+          echo "  Strategy : ${{ github.event.inputs.upgrade_strategy }}"
+          echo "  Actor    : ${{ github.actor }}"
           echo "========================================="
 
   # ─────────────────────────────────────────────────────────────────────────
-  # STAGE 2 — Main upgrade job (runs only after approval)
+  # STAGE 2 — Main upgrade job
   # ─────────────────────────────────────────────────────────────────────────
   discover-and-upgrade:
     runs-on: ubuntu-latest
@@ -88,10 +78,14 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # ── 2. Azure Login via OIDC (no stored secret) ───────────────────────
-    # FIX: Replaced AZURE_AKS_CREDENTIALS (stored secret + env exposure)
-    #      with OIDC/Workload Identity federation.
-    # Setup: az ad app federated-credential create ... (one-time, see README)
+    # ── 2. Azure Login via OIDC (no stored client secret) ────────────────
+    # One-time setup:
+    #   az ad app federated-credential create --id <app-object-id> \
+    #     --parameters '{"name":"github-aks",
+    #                    "issuer":"https://token.actions.githubusercontent.com",
+    #                    "subject":"repo:<org>/<repo>:ref:refs/heads/main",
+    #                    "audiences":["api://AzureADTokenExchange"]}'
+    # Add AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID as repo secrets.
     - name: Azure Login (OIDC)
       uses: azure/login@v2
       with:
@@ -99,7 +93,38 @@ jobs:
         tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # ── 3. Validate cluster existence & state ────────────────────────────
+    # ── 3. Advisory inventory check (non-blocking warning) ───────────────
+    - name: Inventory Check (Advisory)
+      run: |
+        # Update these lists to match your environment.
+        # This is a WARNING only — Azure hard-validates in the next step.
+        KNOWN_CLUSTERS=("agic-cluster-1" "agic-cluster-2" "dev-cluster" "staging-cluster")
+        INPUT_CLUSTER="${{ github.event.inputs.cluster_name }}"
+        CLUSTER_FOUND=0
+        for c in "${KNOWN_CLUSTERS[@]}"; do
+          [ "$c" == "$INPUT_CLUSTER" ] && CLUSTER_FOUND=1 && break
+        done
+        if [ "$CLUSTER_FOUND" -eq 0 ]; then
+          echo "⚠️  Advisory: '$INPUT_CLUSTER' is not in the known cluster inventory."
+          echo "    Proceeding — Azure will hard-validate existence in the next step."
+        else
+          echo "✅ Cluster '$INPUT_CLUSTER' found in known inventory."
+        fi
+
+        KNOWN_RGS=("agicdemo-1" "agicdemo-2" "dev-rg" "staging-rg")
+        INPUT_RG="${{ github.event.inputs.resource_group }}"
+        RG_FOUND=0
+        for r in "${KNOWN_RGS[@]}"; do
+          [ "$r" == "$INPUT_RG" ] && RG_FOUND=1 && break
+        done
+        if [ "$RG_FOUND" -eq 0 ]; then
+          echo "⚠️  Advisory: Resource group '$INPUT_RG' is not in the known inventory."
+          echo "    Proceeding — Azure will hard-validate existence in the next step."
+        else
+          echo "✅ Resource group '$INPUT_RG' found in known inventory."
+        fi
+
+    # ── 4. Validate cluster existence, power state, provisioning state ────
     - name: Validate Cluster and Get Current Version
       id: cluster_info
       run: |
@@ -107,17 +132,18 @@ jobs:
         echo "Validating cluster"
         echo "========================================="
 
-        if ! az aks show \
-              --name "${{ github.event.inputs.cluster_name }}" \
-              --resource-group "${{ github.event.inputs.resource_group }}" \
-              &>/dev/null; then
-          echo "Error: Cluster ${{ github.event.inputs.cluster_name }} not found in RG ${{ github.event.inputs.resource_group }}"
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+
+        if ! az aks show --name "$CLUSTER" --resource-group "$RG" &>/dev/null; then
+          echo "Error: Cluster '$CLUSTER' not found in resource group '$RG'."
+          echo "Please verify the cluster name and resource group and try again."
           exit 1
         fi
 
         CLUSTER_INFO=$(az aks show \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --name "$CLUSTER" \
+          --resource-group "$RG" \
           --query "{name:name, kubernetesVersion:kubernetesVersion, powerState:powerState.code, provisioningState:provisioningState}" \
           -o json)
 
@@ -129,10 +155,10 @@ jobs:
         echo "cluster_state=$CLUSTER_STATE"     >> "$GITHUB_OUTPUT"
         echo "provisioning_state=$PROV_STATE"   >> "$GITHUB_OUTPUT"
 
-        echo "Cluster          : ${{ github.event.inputs.cluster_name }}"
-        echo "Resource Group   : ${{ github.event.inputs.resource_group }}"
-        echo "Current Version  : $CURRENT_VERSION"
-        echo "Cluster State    : $CLUSTER_STATE"
+        echo "Cluster           : $CLUSTER"
+        echo "Resource Group    : $RG"
+        echo "Current Version   : $CURRENT_VERSION"
+        echo "Cluster State     : $CLUSTER_STATE"
         echo "Provisioning State: $PROV_STATE"
 
         if [ "$CLUSTER_STATE" != "Running" ]; then
@@ -141,50 +167,57 @@ jobs:
         fi
 
         if [ "$PROV_STATE" != "Succeeded" ]; then
-          echo "Error: Cluster provisioning state is $PROV_STATE (not Succeeded). Aborting."
+          echo "Error: Cluster provisioning state is $PROV_STATE (expected Succeeded). Aborting."
           exit 1
         fi
 
-    # ── 4. Check available upgrade paths ─────────────────────────────────
+    # ── 5. Check available upgrade paths ─────────────────────────────────
     - name: Get Available Upgrade Versions
       id: available_versions
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+
         echo "Checking available upgrade versions..."
 
         UPGRADE_INFO=$(az aks get-upgrades \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --name "$CLUSTER" \
+          --resource-group "$RG" \
           -o json 2>/dev/null || echo '{"controlPlaneProfile":{"upgrades":[]}}')
 
         UPGRADE_COUNT=$(echo "$UPGRADE_INFO" | jq '.controlPlaneProfile.upgrades | length' 2>/dev/null || echo "0")
 
         if [ "$UPGRADE_COUNT" -eq "0" ]; then
-          echo "No upgrades available. Current version may already be the latest."
+          echo "No upgrades available. Cluster may already be on the latest version."
           echo "upgrade_available=false" >> "$GITHUB_OUTPUT"
         else
-          AVAILABLE_VERSIONS=$(echo "$UPGRADE_INFO" | jq -r '.controlPlaneProfile.upgrades[].kubernetesVersion')
+          AVAILABLE=$(echo "$UPGRADE_INFO" | jq -r '.controlPlaneProfile.upgrades[].kubernetesVersion')
           echo "Available versions:"
-          echo "$AVAILABLE_VERSIONS" | sed 's/^/  - /'
+          echo "$AVAILABLE" | sed 's/^/  - /'
           echo "upgrade_available=true" >> "$GITHUB_OUTPUT"
-          echo "$AVAILABLE_VERSIONS" > available-versions.txt
+          echo "$AVAILABLE" > available-versions.txt
         fi
 
-    # ── 5. Validate target version & minor-version skip guard ────────────
+    # ── 6. Validate target version + enforce no minor-version skipping ────
     - name: Validate Target Version
       if: steps.available_versions.outputs.upgrade_available == 'true'
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
         TARGET="${{ github.event.inputs.target_version }}"
         CURRENT="${{ steps.cluster_info.outputs.current_version }}"
 
         echo "Validating target version: $TARGET (current: $CURRENT)"
 
-        # FIX: Enforce no minor-version skipping (Kubernetes does not support it)
         CURRENT_MINOR=$(echo "$CURRENT" | cut -d. -f2)
         TARGET_MINOR=$(echo "$TARGET"   | cut -d. -f2)
         VERSION_DIFF=$(( TARGET_MINOR - CURRENT_MINOR ))
 
         if [ "$VERSION_DIFF" -gt 1 ]; then
-          echo "Error: Cannot skip minor versions. Current minor=$CURRENT_MINOR, target minor=$TARGET_MINOR (diff=$VERSION_DIFF)."
+          echo "Error: Cannot skip minor versions."
+          echo "  Current minor : $CURRENT_MINOR"
+          echo "  Target minor  : $TARGET_MINOR"
+          echo "  Difference    : $VERSION_DIFF"
           echo "Kubernetes only supports upgrading one minor version at a time."
           exit 1
         fi
@@ -194,10 +227,9 @@ jobs:
           exit 1
         fi
 
-        # Confirm Azure offers this exact version
         if ! az aks get-upgrades \
-              --name "${{ github.event.inputs.cluster_name }}" \
-              --resource-group "${{ github.event.inputs.resource_group }}" \
+              --name "$CLUSTER" \
+              --resource-group "$RG" \
               --query "controlPlaneProfile.upgrades[?kubernetesVersion=='$TARGET']" \
               -o tsv | grep -q .; then
           echo "Error: Version $TARGET is not listed as an available upgrade by Azure."
@@ -207,37 +239,38 @@ jobs:
           exit 1
         fi
 
-        echo "Target version $TARGET is valid."
+        echo "✅ Target version $TARGET is valid."
 
-    # ── 6. Take pre-upgrade cluster snapshot ─────────────────────────────
+    # ── 7. Pre-upgrade cluster snapshot ───────────────────────────────────
     - name: Pre-upgrade Snapshot
       run: |
-        echo "Creating pre-upgrade snapshot..."
-        CLUSTER_ID=$(az aks show \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
-          --query "id" -o tsv)
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
 
-        SNAPSHOT_NAME="pre-upgrade-${{ github.event.inputs.cluster_name }}-$(date +%Y%m%d%H%M%S)"
+        echo "Creating pre-upgrade snapshot..."
+        CLUSTER_ID=$(az aks show --name "$CLUSTER" --resource-group "$RG" --query "id" -o tsv)
+        LOCATION=$(az aks show --name "$CLUSTER" --resource-group "$RG" --query "location" -o tsv)
+        SNAPSHOT_NAME="pre-upgrade-${CLUSTER}-$(date +%Y%m%d%H%M%S)"
 
         az aks snapshot create \
           --name "$SNAPSHOT_NAME" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --resource-group "$RG" \
           --cluster-id "$CLUSTER_ID" \
-          --location "$(az aks show --name ${{ github.event.inputs.cluster_name }} --resource-group ${{ github.event.inputs.resource_group }} --query location -o tsv)" \
-          || echo "Warning: Snapshot creation failed — continuing (non-fatal). Check permissions for Microsoft.ContainerService/snapshots/write."
+          --location "$LOCATION" \
+          && echo "✅ Snapshot created: $SNAPSHOT_NAME" \
+          || echo "⚠️  Warning: Snapshot creation failed (non-fatal). Verify Microsoft.ContainerService/snapshots/write permission."
 
-        echo "Snapshot name: $SNAPSHOT_NAME"
-
-    # ── 7. Fetch node pools ───────────────────────────────────────────────
+    # ── 8. Fetch node pools ───────────────────────────────────────────────
     - name: Get Node Pools Information
       id: node_pools
       run: |
-        echo "Fetching node pools..."
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
 
+        echo "Fetching node pools..."
         NODE_POOLS=$(az aks nodepool list \
-          --cluster-name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --cluster-name "$CLUSTER" \
+          --resource-group "$RG" \
           -o json)
 
         echo "$NODE_POOLS" > node-pools.json
@@ -248,45 +281,49 @@ jobs:
         NODE_POOL_COUNT=$(echo "$NODE_POOLS" | jq '. | length')
         echo "node_pool_count=$NODE_POOL_COUNT" >> "$GITHUB_OUTPUT"
 
-    # ── 8. Configure zero-downtime upgrade settings on each node pool ─────
+    # ── 9. Configure zero-downtime upgrade settings ───────────────────────
     - name: Configure Node Pool Upgrade Settings
       if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
-        echo "Configuring zero-downtime upgrade settings on node pools..."
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
 
-        # FIX: Use process substitution to avoid subshell exit-code swallowing
+        echo "Configuring zero-downtime upgrade settings on node pools..."
         FAILED=0
+
         while IFS= read -r NODEPOOL; do
           NODEPOOL_NAME=$(echo "$NODEPOOL" | jq -r '.name')
           echo "  Configuring $NODEPOOL_NAME ..."
 
           az aks nodepool update \
-            --cluster-name "${{ github.event.inputs.cluster_name }}" \
+            --cluster-name "$CLUSTER" \
             --name "$NODEPOOL_NAME" \
-            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --resource-group "$RG" \
             --max-surge "${{ github.event.inputs.max_surge }}" \
             --drain-timeout "${{ github.event.inputs.drain_timeout }}" \
             --node-soak-duration 5 \
-            || { echo "  Warning: Could not configure $NODEPOOL_NAME"; FAILED=$((FAILED+1)); }
-
-          echo "  Done: max-surge=${{ github.event.inputs.max_surge }}, drain-timeout=${{ github.event.inputs.drain_timeout }}m"
+            && echo "  ✅ $NODEPOOL_NAME configured." \
+            || { echo "  ⚠️  Warning: Could not configure $NODEPOOL_NAME."; FAILED=$((FAILED+1)); }
         done < <(jq -c '.[]' node-pools.json)
 
         if [ "$FAILED" -gt 0 ]; then
-          echo "Warning: $FAILED node pool(s) could not be configured. Continuing — upgrade will use existing settings."
+          echo "Warning: $FAILED node pool(s) could not be configured. Upgrade will use existing settings."
         fi
 
-    # ── 9. Pre-upgrade health check ───────────────────────────────────────
+    # ── 10. Pre-upgrade health check ──────────────────────────────────────
     - name: Pre-upgrade Health Check
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+
         echo "========================================="
         echo "Pre-upgrade health checks"
         echo "========================================="
 
-        # FIX: Use RBAC-bound credentials, not --admin
+        # RBAC-bound credentials — no --admin flag
         az aks get-credentials \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --name "$CLUSTER" \
+          --resource-group "$RG" \
           --overwrite-existing
 
         echo "--- Node status ---"
@@ -307,28 +344,26 @@ jobs:
         echo "--- Pod Disruption Budgets ---"
         kubectl get pdb --all-namespaces 2>/dev/null || echo "  No PDBs found."
 
-        # FIX: Warn on PDBs that could deadlock node draining
-        echo "--- Checking for potentially blocking PDBs ---"
+        echo "--- Checking for potentially drain-blocking PDBs ---"
         BLOCKING=$(kubectl get pdb --all-namespaces -o json 2>/dev/null | \
           jq -r '.items[] |
             select(
-              (.spec.minAvailable == (.status.currentHealthy | tostring)) or
               (.spec.maxUnavailable == "0") or
               (.spec.maxUnavailable == 0)
             ) |
             "\(.metadata.namespace)/\(.metadata.name)"')
 
         if [ -n "$BLOCKING" ]; then
-          echo "Warning: The following PDBs may block node draining:"
+          echo "⚠️  Warning: The following PDBs have maxUnavailable=0 and may block draining:"
           echo "$BLOCKING" | sed 's/^/  - /'
-          echo "Review these before proceeding. The upgrade will continue but draining may stall."
+          echo "Review before proceeding. The upgrade will continue but draining may stall."
         else
-          echo "  No blocking PDBs detected."
+          echo "  ✅ No drain-blocking PDBs detected."
         fi
 
         echo "Pre-upgrade health check passed."
 
-    # ── 10. Get control plane version ────────────────────────────────────
+    # ── 11. Get current control plane version ─────────────────────────────
     - name: Get Control Plane Version
       id: control_plane
       run: |
@@ -340,16 +375,19 @@ jobs:
         echo "control_plane_version=$CP_VERSION" >> "$GITHUB_OUTPUT"
         echo "Control plane version: $CP_VERSION"
 
-    # ── 11. Upgrade control plane ─────────────────────────────────────────
+    # ── 12. Upgrade control plane ─────────────────────────────────────────
     - name: Upgrade Control Plane
       if: github.event.inputs.upgrade_strategy != 'Node Pools Only'
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+        CURRENT_CP="${{ steps.control_plane.outputs.control_plane_version }}"
+        TARGET="${{ github.event.inputs.target_version }}"
+
         echo "========================================="
         echo "Upgrading control plane"
         echo "========================================="
 
-        CURRENT_CP="${{ steps.control_plane.outputs.control_plane_version }}"
-        TARGET="${{ github.event.inputs.target_version }}"
         CURRENT_MINOR=$(echo "$CURRENT_CP" | cut -d. -f2)
         TARGET_MINOR=$(echo "$TARGET"      | cut -d. -f2)
 
@@ -358,21 +396,25 @@ jobs:
         elif [ "$TARGET_MINOR" -gt "$CURRENT_MINOR" ]; then
           echo "Upgrading control plane: $CURRENT_CP → $TARGET"
           az aks upgrade \
-            --name "${{ github.event.inputs.cluster_name }}" \
-            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --name "$CLUSTER" \
+            --resource-group "$RG" \
             --kubernetes-version "$TARGET" \
             --control-plane-only \
             --yes
-          echo "Control plane upgrade completed."
+          echo "✅ Control plane upgrade completed."
         else
           echo "Error: Target ($TARGET) is older than current control plane ($CURRENT_CP). Aborting."
           exit 1
         fi
 
-    # ── 12. Upgrade worker node pools (zero downtime) ─────────────────────
+    # ── 13. Upgrade worker node pools (zero downtime) ─────────────────────
     - name: Upgrade Worker Node Pools
       if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+        TARGET="${{ github.event.inputs.target_version }}"
+
         echo "========================================="
         echo "Upgrading worker node pools (zero downtime)"
         echo "========================================="
@@ -383,11 +425,10 @@ jobs:
         fi
 
         CONTROL_PLANE_VERSION=$(az aks show \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --name "$CLUSTER" \
+          --resource-group "$RG" \
           --query "kubernetesVersion" -o tsv)
 
-        TARGET="${{ github.event.inputs.target_version }}"
         CP_MINOR=$(echo "$CONTROL_PLANE_VERSION" | cut -d. -f2)
         TARGET_MINOR=$(echo "$TARGET"             | cut -d. -f2)
 
@@ -400,15 +441,15 @@ jobs:
           exit 1
         fi
 
-        # Helper: upgrade a single node pool with timeout-aware polling
-        # FIX: runs in main shell via function — exit 1 propagates correctly
+        # ── Helper: upgrade one node pool with timeout-aware polling ─────
+        # Defined as a shell function so exit codes propagate to the parent job
         upgrade_nodepool() {
-          local NODEPOOL_NAME="$1"
+          local NAME="$1"
           local CURRENT_VERSION="$2"
           local POOL_TYPE="$3"
 
           echo "----------------------------------------"
-          echo "Upgrading $POOL_TYPE node pool: $NODEPOOL_NAME"
+          echo "Upgrading $POOL_TYPE node pool: $NAME"
           echo "  Current: $CURRENT_VERSION  →  Target: $TARGET"
 
           if [ "$CURRENT_VERSION" == "$TARGET" ]; then
@@ -419,41 +460,41 @@ jobs:
           NODE_MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
           DIFF=$(( TARGET_MINOR - NODE_MINOR ))
           if [ "$DIFF" -gt 1 ]; then
-            echo "Error: Skipping minor versions for $NODEPOOL_NAME ($CURRENT_VERSION → $TARGET, diff=$DIFF)."
+            echo "Error: Minor-version skip detected for $NAME ($CURRENT_VERSION → $TARGET, diff=$DIFF)."
             return 1
           fi
 
           az aks nodepool upgrade \
-            --cluster-name "${{ github.event.inputs.cluster_name }}" \
-            --name "$NODEPOOL_NAME" \
-            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --cluster-name "$CLUSTER" \
+            --name "$NAME" \
+            --resource-group "$RG" \
             --kubernetes-version "$TARGET" \
             --no-wait
 
-          # FIX: Timeout-aware polling loop (max 80 × 30 s = 40 min per pool)
-          echo "  Waiting for $NODEPOOL_NAME to complete..."
+          # Timeout-aware polling — max 80 × 30 s = 40 min per pool
+          echo "  Waiting for $NAME to complete..."
           MAX_WAIT=80
           COUNT=0
           while true; do
             STATUS=$(az aks nodepool show \
-              --cluster-name "${{ github.event.inputs.cluster_name }}" \
-              --name "$NODEPOOL_NAME" \
-              --resource-group "${{ github.event.inputs.resource_group }}" \
+              --cluster-name "$CLUSTER" \
+              --name "$NAME" \
+              --resource-group "$RG" \
               --query "provisioningState" -o tsv 2>/dev/null || echo "Unknown")
 
             echo "  [$COUNT/$MAX_WAIT] State: $STATUS"
 
             if [ "$STATUS" == "Succeeded" ]; then
-              echo "  ✅ $NODEPOOL_NAME upgraded successfully."
+              echo "  ✅ $NAME upgraded successfully."
               return 0
             elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Canceled" ]; then
-              echo "  ❌ $NODEPOOL_NAME upgrade $STATUS."
+              echo "  ❌ $NAME upgrade $STATUS."
               return 1
             fi
 
             COUNT=$((COUNT + 1))
             if [ "$COUNT" -ge "$MAX_WAIT" ]; then
-              echo "  ❌ Timeout waiting for $NODEPOOL_NAME after $((MAX_WAIT * 30 / 60)) minutes."
+              echo "  ❌ Timeout waiting for $NAME after $((MAX_WAIT * 30 / 60)) minutes."
               return 1
             fi
 
@@ -491,9 +532,9 @@ jobs:
           exit 1
         fi
 
-        echo "All node pools upgraded successfully."
+        echo "✅ All node pools upgraded successfully."
 
-    # ── 13. Post-worker health check ──────────────────────────────────────
+    # ── 14. Post-worker health check ──────────────────────────────────────
     - name: Post-Worker-Upgrade Health Check
       if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
       run: |
@@ -511,27 +552,30 @@ jobs:
         kubectl get nodes -o json | \
           jq -r '.items[] | "  - \(.metadata.name): \(.status.nodeInfo.kubeletVersion)"' 2>/dev/null
 
-        echo "--- Pod status (non-Running / non-Completed) ---"
+        echo "--- Non-healthy pods ---"
         NON_HEALTHY=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | \
           grep -v -E "\s(Running|Completed|Succeeded)\s" | wc -l)
         if [ "$NON_HEALTHY" -gt 0 ]; then
           echo "Warning: $NON_HEALTHY pod(s) are not in Running/Completed state:"
           kubectl get pods --all-namespaces | grep -v -E "\s(Running|Completed|Succeeded)\s"
         else
-          echo "  All pods healthy."
+          echo "  ✅ All pods healthy."
         fi
 
-    # ── 14. Final verification ────────────────────────────────────────────
+    # ── 15. Final verification ────────────────────────────────────────────
     - name: Final Verification
       id: final_verification
       run: |
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+
         echo "========================================="
         echo "Final verification"
         echo "========================================="
 
         FINAL_INFO=$(az aks show \
-          --name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --name "$CLUSTER" \
+          --resource-group "$RG" \
           --query "{version:kubernetesVersion, powerState:powerState.code}" \
           -o json)
 
@@ -543,8 +587,8 @@ jobs:
         echo "========================================="
         echo "UPGRADE SUMMARY"
         echo "========================================="
-        echo "  Cluster         : ${{ github.event.inputs.cluster_name }}"
-        echo "  Resource Group  : ${{ github.event.inputs.resource_group }}"
+        echo "  Cluster         : $CLUSTER"
+        echo "  Resource Group  : $RG"
         echo "  Previous Version: ${{ steps.cluster_info.outputs.current_version }}"
         echo "  Final Version   : $FINAL_VERSION"
         echo "  Cluster State   : $CLUSTER_STATE"
@@ -552,12 +596,12 @@ jobs:
         echo ""
         echo "Node Pool Versions:"
         az aks nodepool list \
-          --cluster-name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --cluster-name "$CLUSTER" \
+          --resource-group "$RG" \
           --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count}" \
           -o table
 
-    # ── 15. Application health verification ───────────────────────────────
+    # ── 16. Application health verification ───────────────────────────────
     - name: Post-upgrade Application Verification
       run: |
         echo "========================================="
@@ -568,7 +612,7 @@ jobs:
         kubectl get pods --all-namespaces 2>/dev/null || echo "Unable to get pods."
 
         echo ""
-        echo "--- Deployments rollout status ---"
+        echo "--- Deployment rollout status ---"
         for NS in $(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
           DEPLOYS=$(kubectl get deployments -n "$NS" --no-headers 2>/dev/null | wc -l)
           if [ "$DEPLOYS" -gt 0 ]; then
@@ -581,16 +625,17 @@ jobs:
         echo ""
         echo "✅ Application verification complete."
 
-    # ── 16. Generate upgrade report (FIX: az calls wrapped safely) ────────
+    # ── 17. Generate upgrade report ───────────────────────────────────────
     - name: Generate Upgrade Report
       if: always()
       run: |
-        # FIX: Capture az output separately with error handling
-        # so a mid-failure cluster doesn't corrupt the report
+        CLUSTER="${{ github.event.inputs.cluster_name }}"
+        RG="${{ github.event.inputs.resource_group }}"
+
         NODE_POOL_TABLE="Unable to fetch node pool details"
         NODE_POOL_TABLE=$(az aks nodepool list \
-          --cluster-name "${{ github.event.inputs.cluster_name }}" \
-          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --cluster-name "$CLUSTER" \
+          --resource-group "$RG" \
           --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count}" \
           -o table 2>/dev/null) || true
 
@@ -608,51 +653,54 @@ jobs:
         ## Cluster
         | Field             | Value |
         |-------------------|-------|
-        | Cluster Name      | ${{ github.event.inputs.cluster_name }} |
-        | Resource Group    | ${{ github.event.inputs.resource_group }} |
+        | Cluster Name      | ${CLUSTER} |
+        | Resource Group    | ${RG} |
         | Previous Version  | ${{ steps.cluster_info.outputs.current_version }} |
         | Target Version    | ${{ github.event.inputs.target_version }} |
         | Final Version     | ${FINAL_VERSION} |
         | Job Status        | ${{ job.status }} |
 
         ## Upgrade Configuration
-        | Setting        | Value |
-        |----------------|-------|
-        | Strategy       | ${{ github.event.inputs.upgrade_strategy }} |
-        | Max Surge      | ${{ github.event.inputs.max_surge }} |
-        | Drain Timeout  | ${{ github.event.inputs.drain_timeout }} minutes |
-        | Zero Downtime  | ✅ Enabled |
-        | OIDC Auth      | ✅ No stored credentials |
-        | Snapshot taken | ✅ Pre-upgrade |
+        | Setting       | Value |
+        |---------------|-------|
+        | Strategy      | ${{ github.event.inputs.upgrade_strategy }} |
+        | Max Surge     | ${{ github.event.inputs.max_surge }} |
+        | Drain Timeout | ${{ github.event.inputs.drain_timeout }} minutes |
+        | Zero Downtime | Enabled |
+        | OIDC Auth     | No stored credentials |
+        | Snapshot      | Pre-upgrade snapshot created |
 
         ## Upgrade Steps
-        1. ✅ Manual approval gate
-        2. ✅ Cluster validated (Running + Succeeded)
-        3. ✅ Target version validated (no minor-version skip)
-        4. ✅ Pre-upgrade snapshot created
-        5. ✅ Node pool upgrade settings configured
-        6. ✅ Pre-upgrade health check (nodes + PDB check)
-        7. ${{ github.event.inputs.upgrade_strategy != 'Node Pools Only' && '✅' || '⏭️' }} Control plane upgrade
-        8. ${{ github.event.inputs.upgrade_strategy != 'Control Plane Only' && '✅' || '⏭️' }} Worker node pools upgraded (system → user order)
-        9. ✅ Post-worker health check
-        10. ✅ Final verification
-        11. ✅ Application rollout verified
+        1.  Approved  — Manual approval gate passed
+        2.  Checked   — Inventory advisory check
+        3.  Validated — Cluster validated (Running + Succeeded)
+        4.  Validated — Target version validated (no minor-version skip)
+        5.  Snapshot  — Pre-upgrade snapshot created
+        6.  Configured — Node pool upgrade settings applied
+        7.  Checked   — Pre-upgrade health check (nodes + PDB scan)
+        8.  ${{ github.event.inputs.upgrade_strategy != 'Node Pools Only' && 'Upgraded' || 'Skipped' }} — Control plane
+        9.  ${{ github.event.inputs.upgrade_strategy != 'Control Plane Only' && 'Upgraded' || 'Skipped' }} — Worker node pools (system then user)
+        10. Checked   — Post-worker health check
+        11. Verified  — Final version confirmed
+        12. Verified  — Application rollouts healthy
 
         ## Node Pool Details After Upgrade
         ${NODE_POOL_TABLE}
 
-        ## Notes
-        - Subshell exit-code swallowing fixed (process substitution used throughout)
-        - Polling loops are timeout-bounded (40 min per pool max)
-        - Credentials via OIDC Workload Identity (no client secrets in env)
-        - RBAC-bound kubeconfig (no --admin flag)
-        - PDB blocking check performed pre-upgrade
-        - Minor-version skip guard enforced
+        ## Recovery (if upgrade failed mid-way)
+        1. Check cluster state:
+           az aks show -n ${CLUSTER} -g ${RG}
+        2. Check node pool states:
+           az aks nodepool list --cluster-name ${CLUSTER} -g ${RG} -o table
+        3. Resume node pools only (if control plane already upgraded):
+           Re-trigger pipeline with strategy = "Node Pools Only"
+        4. Restore from snapshot if needed:
+           az aks snapshot list -g ${RG} -o table
         REPORT
 
         cat upgrade-report.md
 
-    # ── 17. Upload report ─────────────────────────────────────────────────
+    # ── 18. Upload report ─────────────────────────────────────────────────
     - name: Upload Upgrade Report
       uses: actions/upload-artifact@v4
       if: always()
@@ -661,15 +709,16 @@ jobs:
         path: upgrade-report.md
         retention-days: 90
 
-    # ── 18. Summary banners ───────────────────────────────────────────────
+    # ── 19. Success / failure banners ─────────────────────────────────────
     - name: Success Banner
       if: success()
       run: |
         echo "========================================="
-        echo "✅ UPGRADE COMPLETED SUCCESSFULLY"
+        echo "UPGRADE COMPLETED SUCCESSFULLY"
         echo "========================================="
         echo "  Cluster  : ${{ github.event.inputs.cluster_name }}"
-        echo "  Version  : ${{ steps.cluster_info.outputs.current_version }} → ${{ steps.final_verification.outputs.final_version }}"
+        echo "  RG       : ${{ github.event.inputs.resource_group }}"
+        echo "  Version  : ${{ steps.cluster_info.outputs.current_version }} -> ${{ steps.final_verification.outputs.final_version }}"
         echo "  Strategy : ${{ github.event.inputs.upgrade_strategy }}"
         echo "  Actor    : ${{ github.actor }}"
         echo "========================================="
@@ -678,16 +727,21 @@ jobs:
       if: failure()
       run: |
         echo "========================================="
-        echo "❌ UPGRADE FAILED"
+        echo "UPGRADE FAILED"
         echo "========================================="
         echo "  Cluster       : ${{ github.event.inputs.cluster_name }}"
         echo "  Resource Group: ${{ github.event.inputs.resource_group }}"
         echo "  Target Version: ${{ github.event.inputs.target_version }}"
         echo "  Actor         : ${{ github.actor }}"
         echo ""
-        echo "  ACTION REQUIRED:"
-        echo "  1. Review the logs above for the failing step."
-        echo "  2. Check cluster state: az aks show -n ${{ github.event.inputs.cluster_name }} -g ${{ github.event.inputs.resource_group }}"
-        echo "  3. If partially upgraded, node pools may be at mixed versions."
-        echo "     Run 'Node Pools Only' strategy to resume, or restore from snapshot."
+        echo "  RECOVERY STEPS:"
+        echo "  1. Review logs above for the failing step."
+        echo "  2. Check cluster state:"
+        echo "     az aks show -n ${{ github.event.inputs.cluster_name }} -g ${{ github.event.inputs.resource_group }}"
+        echo "  3. Check node pool states:"
+        echo "     az aks nodepool list --cluster-name ${{ github.event.inputs.cluster_name }} -g ${{ github.event.inputs.resource_group }} -o table"
+        echo "  4. If control plane upgraded but node pools failed:"
+        echo "     Re-trigger with strategy = 'Node Pools Only'"
+        echo "  5. Restore from pre-upgrade snapshot if needed:"
+        echo "     az aks snapshot list -g ${{ github.event.inputs.resource_group }} -o table"
         echo "========================================="
