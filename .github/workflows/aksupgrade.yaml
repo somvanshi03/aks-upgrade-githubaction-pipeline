@@ -1,4 +1,4 @@
-name: Safe AKS Cluster Upgrade
+name: NEW AKS Cluster Upgrade
 
 on:
   workflow_dispatch:
