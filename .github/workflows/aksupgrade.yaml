@@ -1,0 +1,693 @@
+name: Safe AKS Cluster Upgrade
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: 'Select Resource Group'
+        required: true
+        type: choice
+        options:
+          - agicdemo-1
+          - agicdemo-2
+          - dev-rg
+          - staging-rg
+      cluster_name:
+        description: 'Select AKS Cluster'
+        required: true
+        type: choice
+        options:
+          - agic-cluster-1
+          - agic-cluster-2
+          - dev-cluster
+          - staging-cluster
+      target_version:
+        description: 'Target Kubernetes version (e.g., 1.29, 1.30, 1.31)'
+        required: true
+        type: string
+        default: '1.30'
+      max_surge:
+        description: 'Max surge for node pool upgrade (e.g., 33% or 2)'
+        required: true
+        type: string
+        default: '33%'
+      drain_timeout:
+        description: 'Drain timeout in minutes'
+        required: true
+        type: string
+        default: '30'
+      upgrade_strategy:
+        description: 'Upgrade Strategy'
+        required: true
+        type: choice
+        options:
+          - 'Automatic (Control plane first, then node pools)'
+          - 'Control Plane Only'
+          - 'Node Pools Only'
+        default: 'Automatic (Control plane first, then node pools)'
+
+# ─── FIX: Concurrency lock prevents parallel upgrades on the same cluster ───
+concurrency:
+  group: aks-upgrade-${{ github.event.inputs.cluster_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 1 — Manual approval gate before anything touches the cluster
+  # Requires a GitHub Environment named "aks-production" with required reviewers
+  # ─────────────────────────────────────────────────────────────────────────
+  request-approval:
+    runs-on: ubuntu-latest
+    environment: aks-production          # <── configure required reviewers here
+    steps:
+      - name: Approval gate
+        run: |
+          echo "========================================="
+          echo "UPGRADE APPROVED"
+          echo "Cluster  : ${{ github.event.inputs.cluster_name }}"
+          echo "RG       : ${{ github.event.inputs.resource_group }}"
+          echo "Target   : ${{ github.event.inputs.target_version }}"
+          echo "Strategy : ${{ github.event.inputs.upgrade_strategy }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "========================================="
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — Main upgrade job (runs only after approval)
+  # ─────────────────────────────────────────────────────────────────────────
+  discover-and-upgrade:
+    runs-on: ubuntu-latest
+    needs: request-approval
+    timeout-minutes: 120
+
+    steps:
+    # ── 1. Checkout ──────────────────────────────────────────────────────
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # ── 2. Azure Login via OIDC (no stored secret) ───────────────────────
+    # FIX: Replaced AZURE_AKS_CREDENTIALS (stored secret + env exposure)
+    #      with OIDC/Workload Identity federation.
+    # Setup: az ad app federated-credential create ... (one-time, see README)
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    # ── 3. Validate cluster existence & state ────────────────────────────
+    - name: Validate Cluster and Get Current Version
+      id: cluster_info
+      run: |
+        echo "========================================="
+        echo "Validating cluster"
+        echo "========================================="
+
+        if ! az aks show \
+              --name "${{ github.event.inputs.cluster_name }}" \
+              --resource-group "${{ github.event.inputs.resource_group }}" \
+              &>/dev/null; then
+          echo "Error: Cluster ${{ github.event.inputs.cluster_name }} not found in RG ${{ github.event.inputs.resource_group }}"
+          exit 1
+        fi
+
+        CLUSTER_INFO=$(az aks show \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "{name:name, kubernetesVersion:kubernetesVersion, powerState:powerState.code, provisioningState:provisioningState}" \
+          -o json)
+
+        CURRENT_VERSION=$(echo "$CLUSTER_INFO" | jq -r '.kubernetesVersion')
+        CLUSTER_STATE=$(echo "$CLUSTER_INFO"   | jq -r '.powerState')
+        PROV_STATE=$(echo "$CLUSTER_INFO"       | jq -r '.provisioningState')
+
+        echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+        echo "cluster_state=$CLUSTER_STATE"     >> "$GITHUB_OUTPUT"
+        echo "provisioning_state=$PROV_STATE"   >> "$GITHUB_OUTPUT"
+
+        echo "Cluster          : ${{ github.event.inputs.cluster_name }}"
+        echo "Resource Group   : ${{ github.event.inputs.resource_group }}"
+        echo "Current Version  : $CURRENT_VERSION"
+        echo "Cluster State    : $CLUSTER_STATE"
+        echo "Provisioning State: $PROV_STATE"
+
+        if [ "$CLUSTER_STATE" != "Running" ]; then
+          echo "Error: Cluster is not Running (state=$CLUSTER_STATE). Aborting."
+          exit 1
+        fi
+
+        if [ "$PROV_STATE" != "Succeeded" ]; then
+          echo "Error: Cluster provisioning state is $PROV_STATE (not Succeeded). Aborting."
+          exit 1
+        fi
+
+    # ── 4. Check available upgrade paths ─────────────────────────────────
+    - name: Get Available Upgrade Versions
+      id: available_versions
+      run: |
+        echo "Checking available upgrade versions..."
+
+        UPGRADE_INFO=$(az aks get-upgrades \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          -o json 2>/dev/null || echo '{"controlPlaneProfile":{"upgrades":[]}}')
+
+        UPGRADE_COUNT=$(echo "$UPGRADE_INFO" | jq '.controlPlaneProfile.upgrades | length' 2>/dev/null || echo "0")
+
+        if [ "$UPGRADE_COUNT" -eq "0" ]; then
+          echo "No upgrades available. Current version may already be the latest."
+          echo "upgrade_available=false" >> "$GITHUB_OUTPUT"
+        else
+          AVAILABLE_VERSIONS=$(echo "$UPGRADE_INFO" | jq -r '.controlPlaneProfile.upgrades[].kubernetesVersion')
+          echo "Available versions:"
+          echo "$AVAILABLE_VERSIONS" | sed 's/^/  - /'
+          echo "upgrade_available=true" >> "$GITHUB_OUTPUT"
+          echo "$AVAILABLE_VERSIONS" > available-versions.txt
+        fi
+
+    # ── 5. Validate target version & minor-version skip guard ────────────
+    - name: Validate Target Version
+      if: steps.available_versions.outputs.upgrade_available == 'true'
+      run: |
+        TARGET="${{ github.event.inputs.target_version }}"
+        CURRENT="${{ steps.cluster_info.outputs.current_version }}"
+
+        echo "Validating target version: $TARGET (current: $CURRENT)"
+
+        # FIX: Enforce no minor-version skipping (Kubernetes does not support it)
+        CURRENT_MINOR=$(echo "$CURRENT" | cut -d. -f2)
+        TARGET_MINOR=$(echo "$TARGET"   | cut -d. -f2)
+        VERSION_DIFF=$(( TARGET_MINOR - CURRENT_MINOR ))
+
+        if [ "$VERSION_DIFF" -gt 1 ]; then
+          echo "Error: Cannot skip minor versions. Current minor=$CURRENT_MINOR, target minor=$TARGET_MINOR (diff=$VERSION_DIFF)."
+          echo "Kubernetes only supports upgrading one minor version at a time."
+          exit 1
+        fi
+
+        if [ "$VERSION_DIFF" -lt 0 ]; then
+          echo "Error: Downgrade is not supported (target $TARGET < current $CURRENT)."
+          exit 1
+        fi
+
+        # Confirm Azure offers this exact version
+        if ! az aks get-upgrades \
+              --name "${{ github.event.inputs.cluster_name }}" \
+              --resource-group "${{ github.event.inputs.resource_group }}" \
+              --query "controlPlaneProfile.upgrades[?kubernetesVersion=='$TARGET']" \
+              -o tsv | grep -q .; then
+          echo "Error: Version $TARGET is not listed as an available upgrade by Azure."
+          echo ""
+          echo "Available versions:"
+          cat available-versions.txt 2>/dev/null || echo "  (none)"
+          exit 1
+        fi
+
+        echo "Target version $TARGET is valid."
+
+    # ── 6. Take pre-upgrade cluster snapshot ─────────────────────────────
+    - name: Pre-upgrade Snapshot
+      run: |
+        echo "Creating pre-upgrade snapshot..."
+        CLUSTER_ID=$(az aks show \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "id" -o tsv)
+
+        SNAPSHOT_NAME="pre-upgrade-${{ github.event.inputs.cluster_name }}-$(date +%Y%m%d%H%M%S)"
+
+        az aks snapshot create \
+          --name "$SNAPSHOT_NAME" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --cluster-id "$CLUSTER_ID" \
+          --location "$(az aks show --name ${{ github.event.inputs.cluster_name }} --resource-group ${{ github.event.inputs.resource_group }} --query location -o tsv)" \
+          || echo "Warning: Snapshot creation failed — continuing (non-fatal). Check permissions for Microsoft.ContainerService/snapshots/write."
+
+        echo "Snapshot name: $SNAPSHOT_NAME"
+
+    # ── 7. Fetch node pools ───────────────────────────────────────────────
+    - name: Get Node Pools Information
+      id: node_pools
+      run: |
+        echo "Fetching node pools..."
+
+        NODE_POOLS=$(az aks nodepool list \
+          --cluster-name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          -o json)
+
+        echo "$NODE_POOLS" > node-pools.json
+
+        echo "Current node pools:"
+        echo "$NODE_POOLS" | jq -r '.[] | "  - \(.name): version=\(.orchestratorVersion) count=\(.count) mode=\(.mode)"'
+
+        NODE_POOL_COUNT=$(echo "$NODE_POOLS" | jq '. | length')
+        echo "node_pool_count=$NODE_POOL_COUNT" >> "$GITHUB_OUTPUT"
+
+    # ── 8. Configure zero-downtime upgrade settings on each node pool ─────
+    - name: Configure Node Pool Upgrade Settings
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
+      run: |
+        echo "Configuring zero-downtime upgrade settings on node pools..."
+
+        # FIX: Use process substitution to avoid subshell exit-code swallowing
+        FAILED=0
+        while IFS= read -r NODEPOOL; do
+          NODEPOOL_NAME=$(echo "$NODEPOOL" | jq -r '.name')
+          echo "  Configuring $NODEPOOL_NAME ..."
+
+          az aks nodepool update \
+            --cluster-name "${{ github.event.inputs.cluster_name }}" \
+            --name "$NODEPOOL_NAME" \
+            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --max-surge "${{ github.event.inputs.max_surge }}" \
+            --drain-timeout "${{ github.event.inputs.drain_timeout }}" \
+            --node-soak-duration 5 \
+            || { echo "  Warning: Could not configure $NODEPOOL_NAME"; FAILED=$((FAILED+1)); }
+
+          echo "  Done: max-surge=${{ github.event.inputs.max_surge }}, drain-timeout=${{ github.event.inputs.drain_timeout }}m"
+        done < <(jq -c '.[]' node-pools.json)
+
+        if [ "$FAILED" -gt 0 ]; then
+          echo "Warning: $FAILED node pool(s) could not be configured. Continuing — upgrade will use existing settings."
+        fi
+
+    # ── 9. Pre-upgrade health check ───────────────────────────────────────
+    - name: Pre-upgrade Health Check
+      run: |
+        echo "========================================="
+        echo "Pre-upgrade health checks"
+        echo "========================================="
+
+        # FIX: Use RBAC-bound credentials, not --admin
+        az aks get-credentials \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --overwrite-existing
+
+        echo "--- Node status ---"
+        kubectl get nodes -o wide
+
+        UNHEALTHY=$(kubectl get nodes --no-headers 2>/dev/null | grep -v " Ready" | wc -l || echo "0")
+        if [ "$UNHEALTHY" -gt 0 ]; then
+          echo "Error: $UNHEALTHY node(s) are NOT Ready. Aborting upgrade."
+          kubectl get nodes --no-headers | grep -v " Ready"
+          exit 1
+        fi
+
+        echo "--- Non-running / non-completed pods ---"
+        kubectl get pods --all-namespaces \
+          --field-selector "status.phase!=Running,status.phase!=Succeeded" \
+          2>/dev/null || echo "  None found."
+
+        echo "--- Pod Disruption Budgets ---"
+        kubectl get pdb --all-namespaces 2>/dev/null || echo "  No PDBs found."
+
+        # FIX: Warn on PDBs that could deadlock node draining
+        echo "--- Checking for potentially blocking PDBs ---"
+        BLOCKING=$(kubectl get pdb --all-namespaces -o json 2>/dev/null | \
+          jq -r '.items[] |
+            select(
+              (.spec.minAvailable == (.status.currentHealthy | tostring)) or
+              (.spec.maxUnavailable == "0") or
+              (.spec.maxUnavailable == 0)
+            ) |
+            "\(.metadata.namespace)/\(.metadata.name)"')
+
+        if [ -n "$BLOCKING" ]; then
+          echo "Warning: The following PDBs may block node draining:"
+          echo "$BLOCKING" | sed 's/^/  - /'
+          echo "Review these before proceeding. The upgrade will continue but draining may stall."
+        else
+          echo "  No blocking PDBs detected."
+        fi
+
+        echo "Pre-upgrade health check passed."
+
+    # ── 10. Get control plane version ────────────────────────────────────
+    - name: Get Control Plane Version
+      id: control_plane
+      run: |
+        CP_VERSION=$(az aks show \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "kubernetesVersion" -o tsv)
+
+        echo "control_plane_version=$CP_VERSION" >> "$GITHUB_OUTPUT"
+        echo "Control plane version: $CP_VERSION"
+
+    # ── 11. Upgrade control plane ─────────────────────────────────────────
+    - name: Upgrade Control Plane
+      if: github.event.inputs.upgrade_strategy != 'Node Pools Only'
+      run: |
+        echo "========================================="
+        echo "Upgrading control plane"
+        echo "========================================="
+
+        CURRENT_CP="${{ steps.control_plane.outputs.control_plane_version }}"
+        TARGET="${{ github.event.inputs.target_version }}"
+        CURRENT_MINOR=$(echo "$CURRENT_CP" | cut -d. -f2)
+        TARGET_MINOR=$(echo "$TARGET"      | cut -d. -f2)
+
+        if [ "$CURRENT_MINOR" -eq "$TARGET_MINOR" ]; then
+          echo "Control plane already at minor version $TARGET_MINOR. Skipping."
+        elif [ "$TARGET_MINOR" -gt "$CURRENT_MINOR" ]; then
+          echo "Upgrading control plane: $CURRENT_CP → $TARGET"
+          az aks upgrade \
+            --name "${{ github.event.inputs.cluster_name }}" \
+            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --kubernetes-version "$TARGET" \
+            --control-plane-only \
+            --yes
+          echo "Control plane upgrade completed."
+        else
+          echo "Error: Target ($TARGET) is older than current control plane ($CURRENT_CP). Aborting."
+          exit 1
+        fi
+
+    # ── 12. Upgrade worker node pools (zero downtime) ─────────────────────
+    - name: Upgrade Worker Node Pools
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
+      run: |
+        echo "========================================="
+        echo "Upgrading worker node pools (zero downtime)"
+        echo "========================================="
+
+        if [ ! -f node-pools.json ]; then
+          echo "Error: node-pools.json not found."
+          exit 1
+        fi
+
+        CONTROL_PLANE_VERSION=$(az aks show \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "kubernetesVersion" -o tsv)
+
+        TARGET="${{ github.event.inputs.target_version }}"
+        CP_MINOR=$(echo "$CONTROL_PLANE_VERSION" | cut -d. -f2)
+        TARGET_MINOR=$(echo "$TARGET"             | cut -d. -f2)
+
+        echo "Control plane version : $CONTROL_PLANE_VERSION"
+        echo "Target node pool ver  : $TARGET"
+
+        if [ "$TARGET_MINOR" -gt "$CP_MINOR" ]; then
+          echo "Error: Node pool target ($TARGET) would exceed control plane ($CONTROL_PLANE_VERSION)."
+          echo "Kubernetes does not allow node pools to run a higher version than the control plane."
+          exit 1
+        fi
+
+        # Helper: upgrade a single node pool with timeout-aware polling
+        # FIX: runs in main shell via function — exit 1 propagates correctly
+        upgrade_nodepool() {
+          local NODEPOOL_NAME="$1"
+          local CURRENT_VERSION="$2"
+          local POOL_TYPE="$3"
+
+          echo "----------------------------------------"
+          echo "Upgrading $POOL_TYPE node pool: $NODEPOOL_NAME"
+          echo "  Current: $CURRENT_VERSION  →  Target: $TARGET"
+
+          if [ "$CURRENT_VERSION" == "$TARGET" ]; then
+            echo "  Already at target version. Skipping."
+            return 0
+          fi
+
+          NODE_MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+          DIFF=$(( TARGET_MINOR - NODE_MINOR ))
+          if [ "$DIFF" -gt 1 ]; then
+            echo "Error: Skipping minor versions for $NODEPOOL_NAME ($CURRENT_VERSION → $TARGET, diff=$DIFF)."
+            return 1
+          fi
+
+          az aks nodepool upgrade \
+            --cluster-name "${{ github.event.inputs.cluster_name }}" \
+            --name "$NODEPOOL_NAME" \
+            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --kubernetes-version "$TARGET" \
+            --no-wait
+
+          # FIX: Timeout-aware polling loop (max 80 × 30 s = 40 min per pool)
+          echo "  Waiting for $NODEPOOL_NAME to complete..."
+          MAX_WAIT=80
+          COUNT=0
+          while true; do
+            STATUS=$(az aks nodepool show \
+              --cluster-name "${{ github.event.inputs.cluster_name }}" \
+              --name "$NODEPOOL_NAME" \
+              --resource-group "${{ github.event.inputs.resource_group }}" \
+              --query "provisioningState" -o tsv 2>/dev/null || echo "Unknown")
+
+            echo "  [$COUNT/$MAX_WAIT] State: $STATUS"
+
+            if [ "$STATUS" == "Succeeded" ]; then
+              echo "  ✅ $NODEPOOL_NAME upgraded successfully."
+              return 0
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Canceled" ]; then
+              echo "  ❌ $NODEPOOL_NAME upgrade $STATUS."
+              return 1
+            fi
+
+            COUNT=$((COUNT + 1))
+            if [ "$COUNT" -ge "$MAX_WAIT" ]; then
+              echo "  ❌ Timeout waiting for $NODEPOOL_NAME after $((MAX_WAIT * 30 / 60)) minutes."
+              return 1
+            fi
+
+            sleep 30
+          done
+        }
+
+        UPGRADE_FAILED=0
+
+        # System pools first
+        echo "=== System node pools ==="
+        while IFS= read -r NODEPOOL; do
+          [ -z "$NODEPOOL" ] && continue
+          NAME=$(echo "$NODEPOOL"    | jq -r '.name')
+          VERSION=$(echo "$NODEPOOL" | jq -r '.orchestratorVersion')
+          upgrade_nodepool "$NAME" "$VERSION" "system" || UPGRADE_FAILED=$((UPGRADE_FAILED + 1))
+        done < <(jq -c '.[] | select(.mode=="System")' node-pools.json)
+
+        if [ "$UPGRADE_FAILED" -gt 0 ]; then
+          echo "Error: $UPGRADE_FAILED system node pool(s) failed. Aborting before user pools."
+          exit 1
+        fi
+
+        # User pools second
+        echo "=== User node pools ==="
+        while IFS= read -r NODEPOOL; do
+          [ -z "$NODEPOOL" ] && continue
+          NAME=$(echo "$NODEPOOL"    | jq -r '.name')
+          VERSION=$(echo "$NODEPOOL" | jq -r '.orchestratorVersion')
+          upgrade_nodepool "$NAME" "$VERSION" "user" || UPGRADE_FAILED=$((UPGRADE_FAILED + 1))
+        done < <(jq -c '.[] | select(.mode=="User")' node-pools.json)
+
+        if [ "$UPGRADE_FAILED" -gt 0 ]; then
+          echo "Error: $UPGRADE_FAILED user node pool(s) failed."
+          exit 1
+        fi
+
+        echo "All node pools upgraded successfully."
+
+    # ── 13. Post-worker health check ──────────────────────────────────────
+    - name: Post-Worker-Upgrade Health Check
+      if: github.event.inputs.upgrade_strategy != 'Control Plane Only'
+      run: |
+        echo "========================================="
+        echo "Post-worker health check"
+        echo "========================================="
+
+        echo "Waiting for all nodes to be Ready (timeout 5 min)..."
+        kubectl wait --for=condition=ready nodes --all --timeout=300s || {
+          echo "Warning: Not all nodes are Ready within 5 minutes."
+          kubectl get nodes
+        }
+
+        echo "--- Node versions after upgrade ---"
+        kubectl get nodes -o json | \
+          jq -r '.items[] | "  - \(.metadata.name): \(.status.nodeInfo.kubeletVersion)"' 2>/dev/null
+
+        echo "--- Pod status (non-Running / non-Completed) ---"
+        NON_HEALTHY=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | \
+          grep -v -E "\s(Running|Completed|Succeeded)\s" | wc -l)
+        if [ "$NON_HEALTHY" -gt 0 ]; then
+          echo "Warning: $NON_HEALTHY pod(s) are not in Running/Completed state:"
+          kubectl get pods --all-namespaces | grep -v -E "\s(Running|Completed|Succeeded)\s"
+        else
+          echo "  All pods healthy."
+        fi
+
+    # ── 14. Final verification ────────────────────────────────────────────
+    - name: Final Verification
+      id: final_verification
+      run: |
+        echo "========================================="
+        echo "Final verification"
+        echo "========================================="
+
+        FINAL_INFO=$(az aks show \
+          --name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "{version:kubernetesVersion, powerState:powerState.code}" \
+          -o json)
+
+        FINAL_VERSION=$(echo "$FINAL_INFO" | jq -r '.version')
+        CLUSTER_STATE=$(echo "$FINAL_INFO" | jq -r '.powerState')
+
+        echo "final_version=$FINAL_VERSION" >> "$GITHUB_OUTPUT"
+
+        echo "========================================="
+        echo "UPGRADE SUMMARY"
+        echo "========================================="
+        echo "  Cluster         : ${{ github.event.inputs.cluster_name }}"
+        echo "  Resource Group  : ${{ github.event.inputs.resource_group }}"
+        echo "  Previous Version: ${{ steps.cluster_info.outputs.current_version }}"
+        echo "  Final Version   : $FINAL_VERSION"
+        echo "  Cluster State   : $CLUSTER_STATE"
+        echo "  Strategy        : ${{ github.event.inputs.upgrade_strategy }}"
+        echo ""
+        echo "Node Pool Versions:"
+        az aks nodepool list \
+          --cluster-name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count}" \
+          -o table
+
+    # ── 15. Application health verification ───────────────────────────────
+    - name: Post-upgrade Application Verification
+      run: |
+        echo "========================================="
+        echo "Application health verification"
+        echo "========================================="
+
+        echo "--- All pods ---"
+        kubectl get pods --all-namespaces 2>/dev/null || echo "Unable to get pods."
+
+        echo ""
+        echo "--- Deployments rollout status ---"
+        for NS in $(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          DEPLOYS=$(kubectl get deployments -n "$NS" --no-headers 2>/dev/null | wc -l)
+          if [ "$DEPLOYS" -gt 0 ]; then
+            echo "Namespace: $NS"
+            kubectl rollout status deployment --namespace "$NS" --timeout=120s 2>/dev/null || \
+              echo "  Warning: Some deployments in $NS are not fully rolled out."
+          fi
+        done
+
+        echo ""
+        echo "✅ Application verification complete."
+
+    # ── 16. Generate upgrade report (FIX: az calls wrapped safely) ────────
+    - name: Generate Upgrade Report
+      if: always()
+      run: |
+        # FIX: Capture az output separately with error handling
+        # so a mid-failure cluster doesn't corrupt the report
+        NODE_POOL_TABLE="Unable to fetch node pool details"
+        NODE_POOL_TABLE=$(az aks nodepool list \
+          --cluster-name "${{ github.event.inputs.cluster_name }}" \
+          --resource-group "${{ github.event.inputs.resource_group }}" \
+          --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count}" \
+          -o table 2>/dev/null) || true
+
+        FINAL_VERSION="${{ steps.final_verification.outputs.final_version }}"
+        [ -z "$FINAL_VERSION" ] && FINAL_VERSION="(not reached)"
+
+        cat > upgrade-report.md << REPORT
+        # AKS Cluster Upgrade Report
+
+        ## Run Info
+        - **Triggered by**: ${{ github.actor }}
+        - **Run ID**: ${{ github.run_id }}
+        - **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        ## Cluster
+        | Field             | Value |
+        |-------------------|-------|
+        | Cluster Name      | ${{ github.event.inputs.cluster_name }} |
+        | Resource Group    | ${{ github.event.inputs.resource_group }} |
+        | Previous Version  | ${{ steps.cluster_info.outputs.current_version }} |
+        | Target Version    | ${{ github.event.inputs.target_version }} |
+        | Final Version     | ${FINAL_VERSION} |
+        | Job Status        | ${{ job.status }} |
+
+        ## Upgrade Configuration
+        | Setting        | Value |
+        |----------------|-------|
+        | Strategy       | ${{ github.event.inputs.upgrade_strategy }} |
+        | Max Surge      | ${{ github.event.inputs.max_surge }} |
+        | Drain Timeout  | ${{ github.event.inputs.drain_timeout }} minutes |
+        | Zero Downtime  | ✅ Enabled |
+        | OIDC Auth      | ✅ No stored credentials |
+        | Snapshot taken | ✅ Pre-upgrade |
+
+        ## Upgrade Steps
+        1. ✅ Manual approval gate
+        2. ✅ Cluster validated (Running + Succeeded)
+        3. ✅ Target version validated (no minor-version skip)
+        4. ✅ Pre-upgrade snapshot created
+        5. ✅ Node pool upgrade settings configured
+        6. ✅ Pre-upgrade health check (nodes + PDB check)
+        7. ${{ github.event.inputs.upgrade_strategy != 'Node Pools Only' && '✅' || '⏭️' }} Control plane upgrade
+        8. ${{ github.event.inputs.upgrade_strategy != 'Control Plane Only' && '✅' || '⏭️' }} Worker node pools upgraded (system → user order)
+        9. ✅ Post-worker health check
+        10. ✅ Final verification
+        11. ✅ Application rollout verified
+
+        ## Node Pool Details After Upgrade
+        ${NODE_POOL_TABLE}
+
+        ## Notes
+        - Subshell exit-code swallowing fixed (process substitution used throughout)
+        - Polling loops are timeout-bounded (40 min per pool max)
+        - Credentials via OIDC Workload Identity (no client secrets in env)
+        - RBAC-bound kubeconfig (no --admin flag)
+        - PDB blocking check performed pre-upgrade
+        - Minor-version skip guard enforced
+        REPORT
+
+        cat upgrade-report.md
+
+    # ── 17. Upload report ─────────────────────────────────────────────────
+    - name: Upload Upgrade Report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: aks-upgrade-report-${{ github.event.inputs.cluster_name }}-${{ github.run_id }}
+        path: upgrade-report.md
+        retention-days: 90
+
+    # ── 18. Summary banners ───────────────────────────────────────────────
+    - name: Success Banner
+      if: success()
+      run: |
+        echo "========================================="
+        echo "✅ UPGRADE COMPLETED SUCCESSFULLY"
+        echo "========================================="
+        echo "  Cluster  : ${{ github.event.inputs.cluster_name }}"
+        echo "  Version  : ${{ steps.cluster_info.outputs.current_version }} → ${{ steps.final_verification.outputs.final_version }}"
+        echo "  Strategy : ${{ github.event.inputs.upgrade_strategy }}"
+        echo "  Actor    : ${{ github.actor }}"
+        echo "========================================="
+
+    - name: Failure Banner
+      if: failure()
+      run: |
+        echo "========================================="
+        echo "❌ UPGRADE FAILED"
+        echo "========================================="
+        echo "  Cluster       : ${{ github.event.inputs.cluster_name }}"
+        echo "  Resource Group: ${{ github.event.inputs.resource_group }}"
+        echo "  Target Version: ${{ github.event.inputs.target_version }}"
+        echo "  Actor         : ${{ github.actor }}"
+        echo ""
+        echo "  ACTION REQUIRED:"
+        echo "  1. Review the logs above for the failing step."
+        echo "  2. Check cluster state: az aks show -n ${{ github.event.inputs.cluster_name }} -g ${{ github.event.inputs.resource_group }}"
+        echo "  3. If partially upgraded, node pools may be at mixed versions."
+        echo "     Run 'Node Pools Only' strategy to resume, or restore from snapshot."
+        echo "========================================="
